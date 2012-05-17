@@ -31,6 +31,10 @@ Meteor._LivedataConnection = function (url, restart_on_update) {
   self.next_method_id = 1;
   // waiting for results of method
   self.outstanding_methods = []; // each item has keys: msg, callback
+  // the sole outstanding method that needs to be waited on, or null
+  self.outstanding_wait_method = null; // same keys as outstanding_methods
+  // methods blocked on outstanding_wait_method being completed.
+  self.blocked_methods = []; // each item has keys: msg, callback, wait
   // waiting for data from method
   self.unsatisfied_methods = {}; // map from method_id -> true
   // sub was ready, is no longer (due to reconnect)
@@ -255,11 +259,21 @@ _.extend(Meteor._LivedataConnection.prototype, {
     return this.apply(name, args, callback);
   },
 
-  apply: function (name, args, callback) {
+  // xcxc find all places that call this
+  // xcxc document that options is actually optional
+  // xcxc explain that wait has no effect on inner method calls
+  apply: function (name, args, options, callback) {
     var self = this;
-    var enclosing = Meteor._CurrentInvocation.get();
 
-    if (callback)
+    // We were passed 3 arguments. They may be either (name, args, options)
+    // or (name, args, callback)
+    if (!callback && typeof options === 'function') {
+      callback = options;
+      options = {};
+    }
+    options = options || {};
+
+    if (callback) {
       // XXX would it be better form to do the binding in stream.on,
       // or caller, instead of here?
       callback = Meteor.bindEnvironment(callback, function (e) {
@@ -267,8 +281,8 @@ _.extend(Meteor._LivedataConnection.prototype, {
         Meteor._debug("Exception while delivering result of invoking '" +
                       name + "'", e.stack);
       });
+    }
 
-    var is_simulation = enclosing && enclosing.is_simulation;
     if (Meteor.is_client) {
       // If on a client, run the stub, if we have one. The stub is
       // supposed to make some temporary writes to the database to
@@ -296,10 +310,10 @@ _.extend(Meteor._LivedataConnection.prototype, {
       }
 
       // If we're in a simulation, stop and return the result we have,
-      // rather than going on to do an RPC. This can only happen on
-      // the client (since we only bother with stubs and simulations
-      // on the client.) If there was not stub, we'll end up returning
-      // undefined.
+      // rather than going on to do an RPC. If there was no stub,
+      // we'll end up returning undefined.
+      var enclosing = Meteor._CurrentInvocation.get();
+      var is_simulation = enclosing && enclosing.is_simulation;
       if (is_simulation) {
         if (callback) {
           callback(exception, ret);
@@ -350,9 +364,30 @@ _.extend(Meteor._LivedataConnection.prototype, {
       params: args,
       id: '' + (self.next_method_id++)
     };
-    self.outstanding_methods.push({msg: msg, callback: callback});
+    if (self.outstanding_wait_method) {
+      self.blocked_methods.push({
+        msg: msg,
+        callback: callback,
+        wait: options.wait
+      });
+    } else {
+      var method_object = {
+        msg: msg,
+        callback: callback
+      };
+
+      if (options.wait)
+        self.outstanding_wait_method = method_object;
+      else
+        self.outstanding_methods.push(method_object);
+
+      self.stream.send(JSON.stringify(msg));
+    }
+
+    // Even if we are waiting on other method calls mark this method
+    // as unsatisfied so that the user never ends up seeing
+    // intermediate versions of the server's datastream
     self.unsatisfied_methods[msg.id] = true;
-    self.stream.send(JSON.stringify(msg));
 
     // If we're using the default callback on the server,
     // synchronously return the result from the remote host.
@@ -553,6 +588,11 @@ _.extend(Meteor._LivedataConnection.prototype, {
 
     // remove
     self.outstanding_methods.splice(i, 1);
+
+    // xcxc
+    if (self.outstanding_methods.length === 0) {
+      
+    }
 
     // deliver result
     if (m.callback) {
