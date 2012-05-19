@@ -55,31 +55,16 @@ Meteor._LivedataConnection = function (url, restart_on_update) {
   // just for testing
   self.quiesce_callbacks = [];
 
-
-  // Setup auto-reload persistence.
   var reload_key = "Server-" + url;
-  var reload_data = Meteor._reload.migration_data(reload_key);
-  if (typeof reload_data === "object") {
-    if (typeof reload_data.next_method_id === "number")
-      self.next_method_id = reload_data.next_method_id;
-    if (typeof reload_data.outstanding_methods === "object")
-      self.outstanding_methods = reload_data.outstanding_methods;
-    // pending messages will be transmitted on initial stream 'reset'
-  }
   Meteor._reload.on_migrate(reload_key, function (retry) {
     if (!self._readyToMigrate()) {
       if (self.retry_migrate)
         throw new Error("Two migrations in progress?");
       self.retry_migrate = retry;
       return false;
+    } else {
+      return [true];
     }
-
-    var methods = _.map(self.outstanding_methods, function (m) {
-      return {msg: m.msg};
-    });
-
-    return [true, {next_method_id: self.next_method_id,
-                   outstanding_methods: methods}];
   });
 
   // Setup stream (if not overriden above)
@@ -133,10 +118,7 @@ Meteor._LivedataConnection = function (url, restart_on_update) {
     // immediately before disconnection.. do we need to add app-level
     // acking of data messages?
 
-    // Send pending methods.
-    _.each(self.outstanding_methods, function (m) {
-      self.stream.send(JSON.stringify(m.msg));
-    });
+    self._sendOutstandingMessages();
 
     // add new subscriptions at the end. this way they take effect after
     // the handlers and we don't see flicker.
@@ -259,9 +241,11 @@ _.extend(Meteor._LivedataConnection.prototype, {
     return this.apply(name, args, callback);
   },
 
-  // xcxc find all places that call this
-  // xcxc document that options is actually optional
-  // xcxc explain that wait has no effect on inner method calls
+  // @param options {Optional Object}
+  //   wait: Boolean - Should we block subsequent method calls on this
+  //                   method's result having been received?
+  //                   (does not effect methods called from within this method)
+  // @param callback {Optional Function}
   apply: function (name, args, options, callback) {
     var self = this;
 
@@ -570,41 +554,73 @@ _.extend(Meteor._LivedataConnection.prototype, {
   },
 
   _livedata_result: function (msg) {
-    var self = this;
     // id, result or error. error has error (code), reason, details
 
+    var self = this;
     // find the outstanding request
     // should be O(1) in nearly all realistic use cases
-    for (var i = 0; i < self.outstanding_methods.length; i++) {
-      var m = self.outstanding_methods[i];
-      if (m.msg.id === msg.id)
-        break;
+    var m;
+    if (self.outstanding_wait_method &&
+        self.outstanding_wait_method.msg.id === msg.id) {
+      m = self.outstanding_wait_method;
+      self.outstanding_wait_method_response = msg;
+    } else {
+      for (var i = 0; i < self.outstanding_methods.length; i++) {
+        m = self.outstanding_methods[i];
+        if (m.msg.id === msg.id)
+          break;
+      }
+
+      // remove
+      self.outstanding_methods.splice(i, 1);
     }
+
     if (!m) {
       // XXX write a better error
       Meteor._debug("Can't interpret method response message");
       return;
     }
 
-    // remove
-    self.outstanding_methods.splice(i, 1);
+    if (self.outstanding_wait_method) {
+      // Wait until we have completed all outstanding methods.
+      if (self.outstanding_methods.length === 0 &&
+         self.outstanding_wait_method_response) {
+        // Fire necessary outstanding method callbacks, making sure we
+        // only fire the outstanding wait method after all other outstanding
+        // methods' callbacks were fired
+        if (m === self.outstanding_wait_method) {
+          self._deliverMethodResponse(self.outstanding_wait_method,
+                       self.outstanding_wait_method_response /*(=== msg)*/);
+        } else {
+          self._deliverMethodResponse(m, msg);
+          self._deliverMethodResponse(self.outstanding_wait_method,
+                       self.outstanding_wait_method_response /*(!== msg)*/);
+        }
 
-    // xcxc
-    if (self.outstanding_methods.length === 0) {
-      
-    }
+        self.outstanding_wait_method = null;
+        self.outstanding_wait_method_response = null;
 
-    // deliver result
-    if (m.callback) {
-      // callback will have already been bindEnvironment'd by apply(),
-      // so no need to catch exceptions
-      if ('error' in msg)
-        m.callback(new Meteor.Error(msg.error.error, msg.error.reason,
-                                    msg.error.details));
-      else
-        // msg.result may be undefined if the method didn't return a
-        // value
-        m.callback(undefined, msg.result);
+        // Find first blocked method with wait: true
+        var i;
+        for (i = 0; i < self.blocked_methods.length; i++)
+          if (self.blocked_methods[i].wait)
+            break;
+
+        // Move as many blocked methods as we can into outstanding_methods
+        // and outstanding_wait_method if needed
+        self.outstanding_methods = _.first(self.blocked_methods, i);
+        if (i !== self.blocked_methods.length) {
+          self.outstanding_wait_method = self.blocked_methods[i];
+          self.blocked_methods = _.rest(self.blocked_methods, i+1);
+        }
+
+        self._sendOutstandingMessages();
+      } else {
+        if (m !== self.outstanding_wait_method)
+          self._deliverMethodResponse(m, msg);
+      }
+    } else {
+      self._deliverMethodResponse(m, msg);
     }
 
     // if we were blocking a migration, see if it's now possible to
@@ -615,21 +631,42 @@ _.extend(Meteor._LivedataConnection.prototype, {
     }
   },
 
+  // @param method {Object} as in `outstanding_methods`
+  // @param response {Object{id, result | error}}
+  _deliverMethodResponse: function(method, response) {
+    // callback will have already been bindEnvironment'd by apply(),
+    // so no need to catch exceptions
+    if ('error' in response) {
+      method.callback(new Meteor.Error(
+        response.error.error, response.error.reason,
+        response.error.details));
+    } else {
+      // msg.result may be undefined if the method didn't return a
+      // value
+      method.callback(undefined, response.result);
+    }
+  },
+
+  _sendOutstandingMessages: function() {
+    var self = this;
+    _.each(self.outstanding_methods, function (m) {
+      self.stream.send(JSON.stringify(m.msg));
+    });
+    if (self.outstanding_wait_method) {
+      self.stream.send(JSON.stringify(self.outstanding_wait_method.msg));
+    }
+  },
+
   _livedata_error: function (msg) {
     Meteor._debug("Received error from server: ", msg.reason);
     if (msg.offending_message)
       Meteor._debug("For: ", msg.offending_message);
   },
 
-  // true if we're OK for a migration to happen
-  _readyToMigrate: function () {
-    var self = this;
-    return _.all(self.outstanding_methods, function (m) {
-      // Callbacks can't be preserved across migrations, so we can't
-      // migrate as long as there is an outstanding requests with a
-      // callback.
-      return !m.callback;
-    });
+  _readyToMigrate: function() {
+    return self.outstanding_methods.length === 0 &&
+      !self.outstanding_wait_method &&
+      self.blocking_methods.length === 0;
   }
 });
 

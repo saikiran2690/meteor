@@ -22,6 +22,36 @@ Meteor.methods({
   }
 });
 
+// Methods to help test applying methods with `wait: true`: funkyman1
+// returns true 500ms after being run unless funkyman2 was run in the
+// meanwhile
+if (Meteor.is_server) {
+  var fun_future;
+  var fun_times;
+  Meteor.methods({
+    funkyman1: function() {
+      fun_future = new Future();
+      fun_times = Meteor.setTimeout(function() {
+        fun_future['return'](true);
+        fun_future = null;
+        fun_times = null;
+      }, 500);
+
+      this.unblock();
+      return fun_future.wait();
+    },
+    funkyman2: function() {
+      if (!fun_future)
+        return; // since funkyman1's timeout had already run
+
+      if (fun_times) clearTimeout(fun_times);
+      fun_future['return'](false);
+      fun_future = null;
+      fun_times = null;
+    }
+  });
+}
+
 /*****/
 
 Ledger = new Meteor.Collection("ledger");

@@ -105,6 +105,26 @@ testAsyncMulti("livedata - basic method invocation", [
                            expect(undefined, [12, {x: 13}])), undefined);
   },
 
+  // test that `wait: false` is respected
+  function (test, expect) {
+    if (Meteor.is_client) {
+      Meteor.apply("funkyman1", [], {wait: false}, expect(function(err, res) {
+        test.equal(res, false);
+      }));
+      Meteor.apply("funkyman2", []);
+    }
+  },
+
+  // test that `wait: true` is respected
+  function(test, expect) {
+    if (Meteor.is_client) {
+      Meteor.apply("funkyman1", [], {wait: true}, expect(function(err, res) {
+        test.equal(res, true);
+      }));
+      Meteor.apply("funkyman2", []);
+    }
+  },
+
   function (test, expect) {
     // No callback
 
